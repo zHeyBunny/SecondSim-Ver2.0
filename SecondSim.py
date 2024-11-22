@@ -1,94 +1,82 @@
-import pandas as pd
 import streamlit as st
-from concurrent.futures import ThreadPoolExecutor
-import time
+import pandas as pd
+from io import BytesIO
+import time  # Импортируем модуль для работы с временем
 
-# Функция для обработки данных
-def process_data(row, base_df):
-    try:
-        primary_number = row['Primary Number']
-    except KeyError:
-        print("Ошибка: Столбец 'Primary Number' не найден")
-        return None
-    
-    # Найдем резервный номер для основного
-    backup_number = base_df[base_df['Primary Number'] == primary_number]['Backup Number']
-    
-    if not backup_number.empty:
-        backup_number = backup_number.iloc[0]
-        return primary_number, backup_number
+# Функция для обработки файлов
+
+
+def process_files(base_file, target_file):
+    # Читаем файлы
+    base_df = pd.read_excel(base_file)
+    target_df = pd.read_excel(target_file)
+
+    # Переименуем столбцы базы для удобства
+    base_df.columns = ['Primary', 'Backup']
+    target_df.columns = ['Primary']
+
+    # Создаем DataFrame для результатов
+    found_df = pd.DataFrame(columns=['Primary', 'Backup'])  # Для совпадений
+    exceptions_df = pd.DataFrame(
+        columns=['Base Primary', 'Base Backup'])  # Для исключений
+    not_found_df = pd.DataFrame(columns=['Not Found'])  # Для не найденных
+
+    # 1. Найдем совпадения по 'Primary' с соответствующим 'Backup' из базы
+    found_df = pd.merge(target_df, base_df, on='Primary', how='left')
+
+    # 2. Для исключений, где 'Primary' не найден в 'Primary', но есть в 'Backup'
+    exceptions_df = base_df[base_df['Backup'].isin(target_df['Primary'])]
+
+    # 3. Для не найденных, где 'Primary' из target_df не найден в базе
+    not_found_df = target_df[~target_df['Primary'].isin(
+        base_df['Primary']) & ~target_df['Primary'].isin(base_df['Backup'])]
+
+    # Теперь исключаем из found_df те номера, которые попали в исключения или не были найдены
+    found_df = found_df[~found_df['Primary'].isin(exceptions_df['Backup'])]
+    found_df = found_df[~found_df['Primary'].isin(not_found_df['Primary'])]
+
+    # Формируем итоговый Excel-файл
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        found_df[['Primary', 'Backup']].to_excel(writer, index=False, startcol=0, startrow=0, header=[
+                                                 'Primary', 'Backup'], sheet_name='Sheet1')
+        exceptions_df[['Primary', 'Backup']].to_excel(writer, index=False, startcol=3, startrow=0, header=[
+                                                      'Base Primary', 'Base Backup'], sheet_name='Sheet1')
+        not_found_df[['Primary']].to_excel(writer, index=False, startcol=6, startrow=0, header=[
+                                           'Not Found'], sheet_name='Sheet1')
+
+    output.seek(0)
+    return output
+
+
+# Интерфейс Streamlit
+st.title("Обработка резервных номеров")
+st.write("Загрузите файлы и начните обработку.")
+
+# Загрузка файлов
+base_file = st.file_uploader(
+    "Загрузите файл с Базой номеров (xlsx)", type="xlsx")
+target_file = st.file_uploader(
+    "Загрузите файл с основными номерами (xlsx)", type="xlsx")
+
+if st.button("Запустить"):
+    if base_file is not None and target_file is not None:
+        start_time = time.time()  # Засекаем время начала
+
+        with st.spinner("Обработка..."):
+            result = process_files(base_file, target_file)
+
+        end_time = time.time()  # Засекаем время окончания
+        processing_time = end_time - start_time  # Вычисляем время выполнения
+
+        st.success(f"Обработка завершена! Время выполнения: {
+                   processing_time:.2f} секунд.")
+        st.download_button("Скачать результат", data=result,
+                           file_name="result.xlsx")
     else:
-        return primary_number, None
+        st.error("Пожалуйста, загрузите оба файла.")
 
-# Функция для параллельной обработки данных
-def parallel_process(base_file, target_file):
-    base_df = pd.read_excel(base_file, header=None)
-    target_df = pd.read_excel(target_file, header=None)
-    
-    # Присваиваем имена столбцов
-    base_df.columns = ['Primary Number', 'Backup Number']
-    target_df.columns = ['Primary Number']
-    
-    # Результаты
-    results_found = []
-    results_exceptions = []
-    results_not_found = []
-    
-    # Обработка строк с использованием параллельных потоков
-    with ThreadPoolExecutor() as executor:
-        futures = []
-        for idx, row in target_df.iterrows():
-            futures.append(executor.submit(process_data, row, base_df))
-        
-        for future in futures:
-            result = future.result()
-            if result:
-                primary_number, backup_number = result
-                if backup_number:
-                    results_found.append((primary_number, backup_number))
-                else:
-                    results_not_found.append(primary_number)
-    
-    # Возвращаем результаты
-    return results_found, results_exceptions, results_not_found
-
-# Стримлит интерфейс
-def main():
-    st.title("Поиск резервных номеров")
-    
-    # Загружаем файлы
-    base_file = st.file_uploader("Загрузите файл Базы", type="xlsx")
-    target_file = st.file_uploader("Загрузите файл с основными номерами", type="xlsx")
-    
-    if base_file and target_file:
-        if st.button('Запустить'):
-            with st.spinner('Обработка файлов...'):
-                start_time = time.time()
-                results_found, results_exceptions, results_not_found = parallel_process(base_file, target_file)
-                processing_time = time.time() - start_time
-                
-                st.success(f"Обработка завершена за {processing_time:.2f} секунд")
-                
-                # Создание итогового DataFrame
-                result_df = pd.DataFrame(columns=["Primary Number", "Backup Number", "Exception Primary", "Exception Backup", "Not Found"])
-                
-                # Заполнение результатов
-                for primary, backup in results_found:
-                    result_df = pd.concat([result_df, pd.DataFrame([{"Primary Number": primary, "Backup Number": backup, "Exception Primary": None, "Exception Backup": None, "Not Found": None}])], ignore_index=True)
-                
-                for primary in results_not_found:
-                    result_df = pd.concat([result_df, pd.DataFrame([{"Primary Number": primary, "Backup Number": None, "Exception Primary": None, "Exception Backup": None, "Not Found": primary}])], ignore_index=True)
-                
-                # Сохранение результата
-                result_df.to_excel('output.xlsx', index=False)
-                st.download_button('Скачать результат', data=open('output.xlsx', 'rb').read(), file_name='output.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-                
-                # Показать результаты
-                st.write(result_df)
-                
-                # Копирайт
-                st.markdown("<p style='text-align: center;'>© zHeyBunny</p>", unsafe_allow_html=True)
-
-# Запуск Streamlit
-if __name__ == '__main__':
-    main()
+# Знак копирайта
+st.markdown("---")
+st.markdown("<p style='text-align: center;'>© zHeyBunny</p>",
+            unsafe_allow_html=True)
